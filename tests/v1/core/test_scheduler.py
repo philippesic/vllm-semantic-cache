@@ -986,6 +986,65 @@ def test_preempt_during_execution():
     assert requests[1].output_token_ids[0] == 42
 
 
+def test_kv_connector_on_request_preempted_called():
+    """A connector's `on_request_preempted` hook must fire exactly once,
+    for the correct request, at the moment it's preempted -- and must not
+    fire for the request that keeps running. This is the connector's only
+    signal that a previously-running request has lost its GPU blocks and
+    been returned to the waiting queue, ahead of its eventual re-admission
+    (which the connector otherwise only learns about via
+    `get_num_new_matched_tokens`/`update_state_after_alloc`, in the same
+    scheduling step admission is decided)."""
+
+    scheduler = create_scheduler(
+        max_num_batched_tokens=100,
+        block_size=16,
+        num_blocks=11,
+        enable_prefix_caching=False,
+        # matched_tokens=0 behaves like "no external cache" for admission
+        # purposes -- this test only cares about the new preemption hook,
+        # reusing the existing MockKVConnector (a real KVConnectorBase_V1
+        # subclass, so it inherits on_request_preempted's real default
+        # unless we override it below) rather than a hand-rolled stub that
+        # would need to reimplement every method the scheduler calls.
+        use_kv_connector=mock_kv(matched_tokens=0, is_async=False),
+    )
+    connector = scheduler.connector
+    preempted_req_ids: list[str] = []
+    connector.on_request_preempted = lambda request: preempted_req_ids.append(
+        request.request_id
+    )
+    requests = create_requests(num_requests=2, num_tokens=80, block_size=16)
+
+    # Schedule the first request.
+    scheduler.add_request(requests[0])
+    scheduler_output0 = scheduler.schedule()
+
+    # Schedule the second request while the first is still running.
+    scheduler.add_request(requests[1])
+    scheduler.schedule()
+
+    assert preempted_req_ids == []
+
+    model_runner_output0 = ModelRunnerOutput(
+        req_ids=[requests[0].request_id],
+        req_id_to_index={requests[0].request_id: 0},
+        sampled_token_ids=[[0]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+    scheduler.update_from_output(scheduler_output0, model_runner_output0)
+
+    # Schedule the first request again. This forces request 1's preemption
+    # because the KV cache is full -- same sequence as
+    # test_preempt_during_execution.
+    scheduler.schedule()
+
+    assert requests[1].status == RequestStatus.PREEMPTED
+    assert preempted_req_ids == [requests[1].request_id]
+
+
 def test_scheduler_reset_prefix_cache():
     scheduler = create_scheduler(enable_prefix_caching=True)
     requests = create_requests(num_requests=10)

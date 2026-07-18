@@ -534,6 +534,24 @@ class KVConnectorBase_V1(ABC):
         """
         return
 
+    def on_request_preempted(self, request: "Request") -> None:
+        """Called by the scheduler when a running request is preempted and
+        returned to the waiting queue, before it is reconsidered for
+        scheduling.
+
+        Unlike `on_new_request`, which fires once per request at initial
+        submission, this fires each time a previously-running request loses
+        its GPU blocks to preemption. Connectors can override this to start
+        speculative work (e.g. reserving and warming blocks for likely
+        high-value content) ahead of the request's eventual re-admission,
+        which otherwise is only visible to the connector at
+        `get_num_new_matched_tokens` / `update_state_after_alloc` time --
+        the same scheduling step admission is decided, too late for any
+        work to complete ahead of the request's own resumption. The default
+        implementation is a no-op.
+        """
+        return
+
     def update_connector_output(self, connector_output: KVConnectorOutput):
         """
         Update KVConnector state from worker-side connectors output.
